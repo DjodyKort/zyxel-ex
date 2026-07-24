@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from types import TracebackType
 from typing import Any
@@ -41,6 +42,7 @@ class ZyxelClient:
         self.base = f"https://{host}"
         self.aes_key: bytes = b""
         self.session_key: str = ""
+        self._device_info: dict[str, Any] | None = None
         # verify=False: these gateways ship a self-signed cert on the LAN.
         self._http = httpx.Client(base_url=self.base, verify=verify, timeout=timeout)
 
@@ -68,18 +70,27 @@ class ZyxelClient:
 
     # -- auth ---------------------------------------------------------------
 
-    def login(self) -> dict[str, Any]:
-        """Perform the RSA+AES handshake and establish a session."""
+    def login(self, *, sha512: bool = False) -> dict[str, Any]:
+        """Perform the RSA+AES handshake and establish a session.
+
+        Some firmware variants expect the password SHA-512-hashed rather than
+        base64-encoded; set ``sha512=True`` for those.
+        """
         rsa_key = self._get_json("/getRSAPublickKey")["RSAPublicKey"]
         self.aes_key = crypto.gen_key()
         iv = crypto.gen_iv()
+        passwd = (
+            hashlib.sha512(self.password.encode()).hexdigest()
+            if sha512
+            else base64.b64encode(self.password.encode()).decode()
+        )
         payload = json.dumps(
             {
                 "Input_Account": self.username,
-                "Input_Passwd": base64.b64encode(self.password.encode()).decode(),
+                "Input_Passwd": passwd,
                 "currLang": "en",
                 "RememberPassword": 0,
-                "SHA512_password": False,
+                "SHA512_password": sha512,
             }
         )
         body = json.dumps(
@@ -132,6 +143,41 @@ class ZyxelClient:
             headers={"Content-Type": "application/x-www-form-urlencoded", "CSRFToken": self.session_key},
         )
         return self._require_ok(self._decrypt(resp), oid)
+
+    # -- convenience --------------------------------------------------------
+
+    def dal_list(self, oid: str) -> list[dict[str, Any]]:
+        """The ``Object`` array of a DAL read (the common list-of-records shape)."""
+        objects: list[dict[str, Any]] = self.dal_get(oid).get("Object", [])
+        return objects
+
+    def update_item(self, oid: str, index: int, changes: dict[str, Any]) -> dict[str, Any]:
+        """Read record ``index`` of ``oid``, apply ``changes``, write it back.
+
+        Model-agnostic: it echoes the device's own record (whatever field names
+        that firmware uses) with only ``changes`` overridden, so toggles/edits
+        work across firmware variants without hardcoding the schema.
+        """
+        for item in self.dal_list(oid):
+            if item.get("Index") == index:
+                return self.dal_put(oid, index, {**item, **changes})
+        raise ZyxelError(f"{oid}: no record with Index {index}")
+
+    def device_info(self) -> dict[str, Any]:
+        """The ``DeviceInfo`` block from ``status`` (model, firmware, serial, uptime)."""
+        if self._device_info is None:
+            self._device_info = next(
+                (o["DeviceInfo"] for o in self.dal_list("status") if o.get("DeviceInfo")), {}
+            )
+        return self._device_info
+
+    @property
+    def model(self) -> str:
+        return str(self.device_info().get("ModelName", ""))
+
+    @property
+    def firmware(self) -> str:
+        return str(self.device_info().get("SoftwareVersion", ""))
 
     # -- internals ----------------------------------------------------------
 
