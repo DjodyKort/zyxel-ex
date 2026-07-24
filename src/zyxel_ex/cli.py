@@ -8,9 +8,11 @@ Adding a capability = adding a command here.
 from __future__ import annotations
 
 import contextlib
+import functools
 import ipaddress
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -18,6 +20,7 @@ import httpx
 from rich.console import Console
 from rich.table import Table
 
+from . import backup as _backup
 from .client import ZyxelClient, ZyxelError
 
 console = Console()
@@ -39,15 +42,31 @@ KNOWN_OIDS = [
 @click.pass_context
 def cli(ctx: click.Context, host: str, user: str, password: str | None, sha512: bool) -> None:
     """Scriptable control for Zyxel EX/AX/VMG (OPAL) home gateways."""
-    if not password:
-        password = click.prompt("Password", hide_input=True)
-    client = ZyxelClient(host, user, password)
-    try:
-        client.login(sha512=sha512)
-    except ZyxelError as e:
-        raise click.ClickException(str(e)) from e
+    # Lazy: don't connect (or prompt for a password) until a command needs the
+    # gateway — so offline commands like `backup decode` work with no modem.
+    client = ZyxelClient(host, user, password or "")
+    client.login_sha512 = sha512
     ctx.obj = client
     ctx.call_on_close(client.close)
+
+
+def needs_login(f: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a command so it logs into the gateway on first use (prompting for a
+    password if none was supplied). Commands that don't touch the gateway skip it."""
+
+    @functools.wraps(f)
+    @click.pass_obj
+    def wrapper(client: ZyxelClient, *args: Any, **kwargs: Any) -> Any:
+        if not client.session_key:
+            if not client.password:
+                client.password = click.prompt("Password", hide_input=True)
+            try:
+                client.login(sha512=client.login_sha512)
+            except ZyxelError as e:
+                raise click.ClickException(str(e)) from e
+        return f(client, *args, **kwargs)
+
+    return wrapper
 
 
 def _objects(client: ZyxelClient, oid: str) -> list[dict[str, Any]]:
@@ -66,7 +85,7 @@ def _yn(value: Any) -> str:
 
 
 @cli.command()
-@click.pass_obj
+@needs_login
 def status(client: ZyxelClient) -> None:
     """Device + firmware summary."""
     dev = client.device_info()
@@ -84,7 +103,7 @@ def status(client: ZyxelClient) -> None:
 
 
 @cli.command()
-@click.pass_obj
+@needs_login
 def info(client: ZyxelClient) -> None:
     """Full device info as JSON."""
     console.print_json(json.dumps(client.device_info()))
@@ -92,7 +111,7 @@ def info(client: ZyxelClient) -> None:
 
 @cli.command()
 @click.confirmation_option(prompt="Reboot the gateway now?")
-@click.pass_obj
+@needs_login
 def reboot(client: ZyxelClient) -> None:
     """Reboot the gateway."""
     client.dal_post("reboot", {})
@@ -100,7 +119,7 @@ def reboot(client: ZyxelClient) -> None:
 
 
 @cli.command()
-@click.pass_obj
+@needs_login
 def wan(client: ZyxelClient) -> None:
     """WAN connection: public IP, gateway, DNS, uptime."""
     w = _wan_iface(client)
@@ -171,7 +190,7 @@ def _fmt_uptime(seconds: Any) -> str:
 @cli.command()
 @click.option("--wifi", "wifi_only", is_flag=True, help="Only Wi-Fi clients")
 @click.option("--active/--all", default=True, help="Only active hosts (default) or every known lease")
-@click.pass_obj
+@needs_login
 def hosts(client: ZyxelClient, wifi_only: bool, active: bool) -> None:
     """Connected LAN / Wi-Fi devices."""
     devices = _lan_devices(client)
@@ -207,7 +226,7 @@ def _lan_devices(client: ZyxelClient) -> list[dict[str, Any]]:
 @click.option("--interval", default=15, show_default=True, type=int, help="Poll interval (seconds)")
 @click.option("--ntfy", metavar="URL", help="ntfy topic URL to push join/leave events to")
 @click.option("--count", default=0, type=int, help="Stop after N polls (0 = until Ctrl+C)")
-@click.pass_obj
+@needs_login
 def watch(client: ZyxelClient, interval: int, ntfy: str | None, count: int) -> None:
     """Watch devices joining/leaving the network (Ctrl+C to stop)."""
     seen: dict[str, str] = {}
@@ -258,7 +277,7 @@ def nat() -> None:
 
 
 @nat.command("list")
-@click.pass_obj
+@needs_login
 def nat_list(client: ZyxelClient) -> None:
     """List port-forward rules."""
     t = Table(title="Port forwarding")
@@ -284,7 +303,7 @@ def nat_list(client: ZyxelClient) -> None:
 @click.option("--int", "int_port", type=int, help="Internal port (default: same as --ext)")
 @click.option("--proto", type=click.Choice(["TCP", "UDP", "ALL"]), default="TCP", show_default=True)
 @click.option("--disabled", is_flag=True, help="Create the rule disabled")
-@click.pass_obj
+@needs_login
 def nat_add(
     client: ZyxelClient,
     name: str,
@@ -317,7 +336,7 @@ def nat_add(
 
 @nat.command("enable")
 @click.argument("index", type=int)
-@click.pass_obj
+@needs_login
 def nat_enable(client: ZyxelClient, index: int) -> None:
     """Enable rule INDEX."""
     client.update_item("nat", index, {"Enable": True})
@@ -326,7 +345,7 @@ def nat_enable(client: ZyxelClient, index: int) -> None:
 
 @nat.command("disable")
 @click.argument("index", type=int)
-@click.pass_obj
+@needs_login
 def nat_disable(client: ZyxelClient, index: int) -> None:
     """Disable rule INDEX."""
     client.update_item("nat", index, {"Enable": False})
@@ -335,7 +354,7 @@ def nat_disable(client: ZyxelClient, index: int) -> None:
 
 @nat.command("rm")
 @click.argument("index", type=int)
-@click.pass_obj
+@needs_login
 def nat_rm(client: ZyxelClient, index: int) -> None:
     """Delete rule INDEX."""
     client.dal_delete("nat", index)
@@ -351,7 +370,7 @@ def wifi() -> None:
 
 
 @wifi.command("list")
-@click.pass_obj
+@needs_login
 def wifi_list(client: ZyxelClient) -> None:
     """List Wi-Fi SSIDs."""
     t = Table(title="Wi-Fi")
@@ -371,7 +390,7 @@ def wifi_list(client: ZyxelClient) -> None:
 
 @wifi.command("enable")
 @click.argument("index", type=int)
-@click.pass_obj
+@needs_login
 def wifi_enable(client: ZyxelClient, index: int) -> None:
     """Enable SSID INDEX."""
     client.update_item("wlan", index, {"wlEnable": True})
@@ -380,7 +399,7 @@ def wifi_enable(client: ZyxelClient, index: int) -> None:
 
 @wifi.command("disable")
 @click.argument("index", type=int)
-@click.pass_obj
+@needs_login
 def wifi_disable(client: ZyxelClient, index: int) -> None:
     """Disable SSID INDEX (this will disconnect its clients)."""
     client.update_item("wlan", index, {"wlEnable": False})
@@ -391,7 +410,7 @@ def wifi_disable(client: ZyxelClient, index: int) -> None:
 
 
 @cli.command()
-@click.pass_obj
+@needs_login
 def dhcp(client: ZyxelClient) -> None:
     """Static DHCP reservations (IP ⇔ MAC bindings)."""
     names = {d.get("PhysAddress", "").lower(): d.get("HostName", "") for d in _lan_devices(client)}
@@ -411,7 +430,7 @@ def dhcp(client: ZyxelClient) -> None:
 
 
 @cli.command()
-@click.pass_obj
+@needs_login
 def firewall(client: ZyxelClient) -> None:
     """Firewall ACL rules."""
     console.print_json(json.dumps(_objects(client, "firewall_acl")))
@@ -423,7 +442,7 @@ def firewall(client: ZyxelClient) -> None:
 @cli.command()
 @click.option("--serve", is_flag=True, help="Run an HTTP /metrics server instead of printing once")
 @click.option("--port", default=9100, show_default=True, type=int)
-@click.pass_obj
+@needs_login
 def metrics(client: ZyxelClient, serve: bool, port: int) -> None:
     """Prometheus metrics — print once, or `--serve` an HTTP exporter."""
     if not serve:
@@ -500,7 +519,7 @@ def _metrics_text(client: ZyxelClient) -> str:
 
 @cli.command()
 @click.argument("oid")
-@click.pass_obj
+@needs_login
 def get(client: ZyxelClient, oid: str) -> None:
     """Dump the decrypted JSON for any OID (e.g. `zyx get wlan`)."""
     console.print_json(json.dumps(client.dal_get(oid)))
@@ -509,7 +528,7 @@ def get(client: ZyxelClient, oid: str) -> None:
 @cli.command("set")
 @click.argument("oid")
 @click.argument("json_body")
-@click.pass_obj
+@needs_login
 def set_(client: ZyxelClient, oid: str, json_body: str) -> None:
     """POST a raw JSON record to an OID (advanced): `zyx set nat '{"Enable":true,...}'`."""
     console.print_json(json.dumps(client.dal_post(oid, json.loads(json_body))))
@@ -519,6 +538,42 @@ def set_(client: ZyxelClient, oid: str, json_body: str) -> None:
 def oids() -> None:
     """List commonly-used OIDs."""
     console.print("\n".join(KNOWN_OIDS))
+
+
+# ── config backup (offline — no gateway needed) ─────────────────────────────
+
+
+@cli.group()
+def backup() -> None:
+    """Decode a Zyxel `.conf` configuration backup."""
+
+
+@backup.command("decode")
+@click.argument("conf_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--secrets", is_flag=True, help="Extract users / PPPoE / Wi-Fi credentials")
+@click.option("--out", type=click.Path(dir_okay=False), help="Write to a file instead of stdout")
+def backup_decode(conf_file: str, secrets: bool, out: str | None) -> None:
+    """Decode a router backup (download it via Maintenance → Backup first).
+
+    Strips the header, LZW-decompresses the config XML, then prints the XML — or,
+    with --secrets, the users / PPPoE / Wi-Fi credentials as JSON.
+    """
+    with open(conf_file, "rb") as fh:
+        xml = _backup.decode_conf(fh.read())
+    if secrets:
+        payload = json.dumps(_backup.extract_secrets(xml), indent=2)
+        if out:
+            with open(out, "w", encoding="utf-8") as fh2:
+                fh2.write(payload)
+            console.print(f"[green]wrote[/] {out}")
+        else:
+            console.print_json(payload)
+    elif out:
+        with open(out, "wb") as fh3:
+            fh3.write(xml)
+        console.print(f"[green]wrote[/] {out} ({len(xml)} bytes)")
+    else:
+        click.echo(xml.decode("utf-8", "replace"))
 
 
 if __name__ == "__main__":

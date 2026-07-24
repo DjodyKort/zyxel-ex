@@ -34,10 +34,16 @@ zyx nat list               # port-forward rules
 zyx nat add --name "My app" --to 192.168.1.21 --ext 8443 --proto TCP
 zyx nat disable 5          # enable / disable / rm a rule
 zyx firewall               # firewall ACLs
+zyx wan                    # public IP / gateway / DNS
+zyx watch [--ntfy URL]     # live device join/leave tracking
+zyx metrics [--serve]      # Prometheus exporter (print once or serve /metrics)
 zyx reboot                 # reboot the gateway
 zyx get <oid>              # raw decrypted JSON for any OID
 zyx set <oid> '{…}'        # POST a raw record (advanced)
 zyx oids                   # commonly-used OIDs
+
+# offline — no gateway needed:
+zyx backup decode dump.conf [--secrets]   # decode a config backup → XML / creds
 ```
 
 Writes are **model-agnostic**: toggles/edits read the device's own record and
@@ -73,12 +79,14 @@ add `--sha512`.
 
 ## Status
 
-v0.2 — model-agnostic client, robust login, and commands for
-status/info/reboot/hosts/nat (full CRUD)/wifi/dhcp/firewall + raw get/set. Built
-to grow: each capability is a small CLI command over a `dal_*` call.
+v0.3 — model-agnostic client + lazy login; commands for
+status/info/reboot/hosts/nat (CRUD)/wifi/dhcp/firewall/wan/watch/metrics +
+raw get/set; a self-contained `.conf` **backup decoder** (ported LZW, no deps);
+fake-gateway pytest + GitHub Actions CI. Built to grow — each capability is a
+small command over a `dal_*` call.
 
-Roadmap: `.conf` backup decoder · Prometheus exporter · device-tracking watch
-mode (+ntfy) · pytest + CI + PyPI · async client.
+Roadmap: `zyx backup pull` (auto-download) · an async client for
+HA/Ansible integrations · more model coverage.
 
 ## License
 

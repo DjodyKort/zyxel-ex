@@ -43,6 +43,7 @@ class ZyxelClient:
         self.base = f"https://{host}"
         self.aes_key: bytes = b""
         self.session_key: str = ""
+        self.login_sha512: bool = False  # set by the CLI; used on lazy login
         self._device_info: dict[str, Any] | None = None
         # verify=False: these gateways ship a self-signed cert on the LAN.
         # transport is injectable for tests (a fake gateway).
