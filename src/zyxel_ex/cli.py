@@ -7,10 +7,13 @@ Adding a capability = adding a command here.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import time
 from typing import Any
 
 import click
+import httpx
 from rich.console import Console
 from rich.table import Table
 
@@ -142,6 +145,52 @@ def _lan_devices(client: ZyxelClient) -> list[dict[str, Any]]:
     obj = client.dal_list("lanhosts")
     devices: list[dict[str, Any]] = obj[0].get("lanhosts", []) if obj else []
     return devices
+
+
+@cli.command()
+@click.option("--interval", default=15, show_default=True, type=int, help="Poll interval (seconds)")
+@click.option("--ntfy", metavar="URL", help="ntfy topic URL to push join/leave events to")
+@click.option("--count", default=0, type=int, help="Stop after N polls (0 = until Ctrl+C)")
+@click.pass_obj
+def watch(client: ZyxelClient, interval: int, ntfy: str | None, count: int) -> None:
+    """Watch devices joining/leaving the network (Ctrl+C to stop)."""
+    seen: dict[str, str] = {}
+    polls = 0
+    console.print(f"[dim]watching {client.host} every {interval}s — Ctrl+C to stop[/]")
+    try:
+        while True:
+            try:
+                devices = _lan_devices(client)
+            except ZyxelError:
+                client.login()  # refresh an expired session
+                devices = _lan_devices(client)
+            current = {
+                d["PhysAddress"].lower(): (d.get("HostName") or "?")
+                for d in devices
+                if d.get("Active") and d.get("PhysAddress")
+            }
+            if seen:
+                for mac in current.keys() - seen.keys():
+                    _track_event(ntfy, "joined", current[mac], mac)
+                for mac in seen.keys() - current.keys():
+                    _track_event(ntfy, "left", seen[mac], mac)
+            elif not polls:
+                console.print(f"[dim]{len(current)} devices online[/]")
+            seen = current
+            polls += 1
+            if count and polls >= count:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("\n[dim]stopped[/]")
+
+
+def _track_event(ntfy: str | None, kind: str, name: str, mac: str) -> None:
+    color = "green" if kind == "joined" else "yellow"
+    console.print(f"[{color}]●[/] [bold]{name}[/] ({mac}) {kind}")
+    if ntfy:
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.post(ntfy, content=f"{name} ({mac}) {kind}".encode(), timeout=5)
 
 
 # ── nat / port forwarding ───────────────────────────────────────────────────
