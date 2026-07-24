@@ -35,6 +35,7 @@ class ZyxelClient:
         *,
         verify: bool = False,
         timeout: float = 20.0,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.host = host
         self.username = username
@@ -44,7 +45,8 @@ class ZyxelClient:
         self.session_key: str = ""
         self._device_info: dict[str, Any] | None = None
         # verify=False: these gateways ship a self-signed cert on the LAN.
-        self._http = httpx.Client(base_url=self.base, verify=verify, timeout=timeout)
+        # transport is injectable for tests (a fake gateway).
+        self._http = httpx.Client(base_url=self.base, verify=verify, timeout=timeout, transport=transport)
 
     # -- lifecycle ----------------------------------------------------------
 
