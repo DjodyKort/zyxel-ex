@@ -8,6 +8,7 @@ Adding a capability = adding a command here.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import time
 from typing import Any
@@ -96,6 +97,61 @@ def reboot(client: ZyxelClient) -> None:
     """Reboot the gateway."""
     client.dal_post("reboot", {})
     console.print("[yellow]reboot requested — the gateway will drop offline shortly.")
+
+
+@cli.command()
+@click.pass_obj
+def wan(client: ZyxelClient) -> None:
+    """WAN connection: public IP, gateway, DNS, uptime."""
+    w = _wan_iface(client)
+    if not w:
+        console.print("[yellow]no active WAN interface with a public IP found")
+        return
+    t = Table(show_header=False, box=None)
+    rows = [
+        ("Public IP", w.get("IPAddress", "")),
+        ("Gateway", w.get("v4Gateway", "")),
+        ("DNS", w.get("DNSServer", "")),
+        ("Type", w.get("AddressingType", "")),
+        ("Status", w.get("Status", "")),
+    ]
+    for label, val in rows:
+        if val:
+            t.add_row(f"[bold]{label}", str(val))
+    up = w.get("ipoeConnectionUpTime") or w.get("UpTime")
+    if up:
+        t.add_row("[bold]Uptime", _fmt_uptime(up))
+    console.print(t)
+
+
+def _is_public_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.version == 4 and addr.is_global
+
+
+def _wan_iface(client: ZyxelClient) -> dict[str, Any]:
+    """The interface record carrying a public IPv4 (WAN), found recursively so it
+    works regardless of where a given firmware nests it in `cardpage_status`."""
+
+    def walk(o: Any) -> Any:
+        if isinstance(o, dict):
+            if _is_public_ip(o.get("IPAddress", "")):
+                yield o
+            for v in o.values():
+                yield from walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                yield from walk(v)
+
+    candidates: list[dict[str, Any]] = list(walk(client.dal_get("cardpage_status")))
+    # Prefer the fuller interface record (the one that also carries gateway/DNS).
+    for c in candidates:
+        if c.get("v4Gateway") or c.get("DNSServer"):
+            return c
+    return candidates[0] if candidates else {}
 
 
 def _fmt_uptime(seconds: Any) -> str:
@@ -359,6 +415,84 @@ def dhcp(client: ZyxelClient) -> None:
 def firewall(client: ZyxelClient) -> None:
     """Firewall ACL rules."""
     console.print_json(json.dumps(_objects(client, "firewall_acl")))
+
+
+# ── prometheus exporter ─────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.option("--serve", is_flag=True, help="Run an HTTP /metrics server instead of printing once")
+@click.option("--port", default=9100, show_default=True, type=int)
+@click.pass_obj
+def metrics(client: ZyxelClient, serve: bool, port: int) -> None:
+    """Prometheus metrics — print once, or `--serve` an HTTP exporter."""
+    if not serve:
+        click.echo(_metrics_text(client), nl=False)
+        return
+
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 (stdlib API)
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                body = _metrics_text(client)
+            except ZyxelError:
+                client.login()
+                body = _metrics_text(client)
+            data = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass  # quiet
+
+    console.print(f"[dim]serving metrics on http://0.0.0.0:{port}/metrics — Ctrl+C to stop[/]")
+    with contextlib.suppress(KeyboardInterrupt):
+        HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _metrics_text(client: ZyxelClient) -> str:
+    dev = client.device_info()
+    active = [d for d in _lan_devices(client) if d.get("Active")]
+    wifi = [d for d in active if d.get("InterfaceType") == "Wi-Fi"]
+    lines = [
+        "# HELP zyxel_up 1 if the gateway responded",
+        "# TYPE zyxel_up gauge",
+        "zyxel_up 1",
+        "# TYPE zyxel_connected_devices gauge",
+        f'zyxel_connected_devices{{type="all"}} {len(active)}',
+        f'zyxel_connected_devices{{type="wifi"}} {len(wifi)}',
+        "# TYPE zyxel_nat_rules gauge",
+        f"zyxel_nat_rules {len(client.dal_list('nat'))}",
+        "# TYPE zyxel_wan_up gauge",
+        f"zyxel_wan_up {1 if _wan_iface(client) else 0}",
+        "# TYPE zyxel_info gauge",
+        f'zyxel_info{{model="{_esc(dev.get("ModelName", ""))}",'
+        f'firmware="{_esc(dev.get("SoftwareVersion", ""))}"}} 1',
+    ]
+    up = dev.get("UpTime")
+    if up:
+        lines += ["# TYPE zyxel_uptime_seconds gauge", f"zyxel_uptime_seconds {int(up)}"]
+    lines.append("# TYPE zyxel_device_online gauge")
+    for d in active:
+        labels = (
+            f'mac="{_esc(d.get("PhysAddress", ""))}",'
+            f'name="{_esc(d.get("HostName", "") or "?")}",'
+            f'ip="{_esc(d.get("IPAddress", ""))}"'
+        )
+        lines.append(f"zyxel_device_online{{{labels}}} 1")
+    return "\n".join(lines) + "\n"
 
 
 # ── raw power tools ─────────────────────────────────────────────────────────
