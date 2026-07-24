@@ -1,0 +1,38 @@
+[project]
+name = "zyxel-ex"
+version = "0.1.0"
+description = "Scriptable client + CLI for Zyxel EX/AX (OPAL firmware) home gateways via the encrypted DAL API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Djody Kort" }]
+dependencies = [
+    "httpx>=0.27",
+    "cryptography>=42",
+    "click>=8.1",
+    "rich>=13",
+]
+
+[project.scripts]
+zyx = "zyxel_ex.cli:cli"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6", "mypy>=1.11", "pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zyxel_ex"]
+
+[tool.ruff]
+line-length = 110
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]

@@ -1,0 +1,182 @@
+"""HTTP client for the Zyxel OPAL DAL API (login + encrypted DAL read/write)."""
+
+from __future__ import annotations
+
+import base64
+import json
+from types import TracebackType
+from typing import Any
+
+import httpx
+
+from . import crypto
+
+DEFAULT_HOST = "192.168.1.1"
+
+
+class ZyxelError(RuntimeError):
+    """A DAL call returned a non-success result, or the transport failed."""
+
+
+class ZyxelClient:
+    """Talks to a Zyxel EX/AX gateway's web API.
+
+    Usage:
+        with ZyxelClient("192.168.1.1", "admin", "secret") as z:
+            print(z.dal_get("nat")["Object"])
+    """
+
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        username: str = "admin",
+        password: str = "",
+        *,
+        verify: bool = False,
+        timeout: float = 20.0,
+    ) -> None:
+        self.host = host
+        self.username = username
+        self.password = password
+        self.base = f"https://{host}"
+        self.aes_key: bytes = b""
+        self.session_key: str = ""
+        # verify=False: these gateways ship a self-signed cert on the LAN.
+        self._http = httpx.Client(base_url=self.base, verify=verify, timeout=timeout)
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def __enter__(self) -> ZyxelClient:
+        self.login()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        try:
+            if self.session_key:
+                self._http.get(f"/cgi-bin/UserLogout?sessionkey={self.session_key}")
+        except httpx.HTTPError:
+            pass
+        self._http.close()
+
+    # -- auth ---------------------------------------------------------------
+
+    def login(self) -> dict[str, Any]:
+        """Perform the RSA+AES handshake and establish a session."""
+        rsa_key = self._get_json("/getRSAPublickKey")["RSAPublicKey"]
+        self.aes_key = crypto.gen_key()
+        iv = crypto.gen_iv()
+        payload = json.dumps(
+            {
+                "Input_Account": self.username,
+                "Input_Passwd": base64.b64encode(self.password.encode()).decode(),
+                "currLang": "en",
+                "RememberPassword": 0,
+                "SHA512_password": False,
+            }
+        )
+        body = json.dumps(
+            {
+                "content": crypto.aes_encrypt(payload, self.aes_key, iv),
+                "key": crypto.rsa_encrypt(base64.b64encode(self.aes_key).decode(), rsa_key),
+                "iv": base64.b64encode(iv).decode(),
+            }
+        )
+        resp = self._post_raw("/UserLogin", body, headers={"Content-Type": "application/json"})
+        data = self._decrypt(resp)
+        if data.get("result") not in (None, "ZCFG_SUCCESS") and "sessionkey" not in data:
+            raise ZyxelError(f"login failed: {data.get('result') or data}")
+        self.session_key = data.get("sessionkey", "")
+        if not self.session_key:
+            raise ZyxelError("login returned no sessionkey (bad credentials or locked account)")
+        return data
+
+    # -- DAL primitives -----------------------------------------------------
+
+    def dal_get(self, oid: str) -> dict[str, Any]:
+        """Read a config/status object."""
+        return self._require_ok(self._decrypt(self._get_raw(f"/cgi-bin/DAL?oid={oid}{self._sk()}")), oid)
+
+    def dal_post(self, oid: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Create/set a record (e.g. add a NAT rule). `data` is the record object."""
+        resp = self._post_raw(
+            f"/cgi-bin/DAL?oid={oid}{self._sk()}",
+            self._encrypt_body(data),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "CSRFToken": self.session_key},
+        )
+        return self._require_ok(self._decrypt(resp), oid)
+
+    def dal_put(self, oid: str, index: int, data: dict[str, Any]) -> dict[str, Any]:
+        """Modify record `index` of `oid`."""
+        resp = self._request_raw(
+            "PUT",
+            f"/cgi-bin/DAL?oid={oid}{self._sk()}&Index={index}",
+            self._encrypt_body(data),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "CSRFToken": self.session_key},
+        )
+        return self._require_ok(self._decrypt(resp), oid)
+
+    def dal_delete(self, oid: str, index: int) -> dict[str, Any]:
+        """Delete record `index` of `oid`."""
+        resp = self._request_raw(
+            "DELETE",
+            f"/cgi-bin/DAL?oid={oid}{self._sk()}&Index={index}",
+            self._encrypt_body({}),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "CSRFToken": self.session_key},
+        )
+        return self._require_ok(self._decrypt(resp), oid)
+
+    # -- internals ----------------------------------------------------------
+
+    def _sk(self) -> str:
+        return f"&sessionkey={self.session_key}" if self.session_key else ""
+
+    def _encrypt_body(self, data: dict[str, Any]) -> str:
+        iv = crypto.gen_iv()
+        return json.dumps(
+            {
+                "content": crypto.aes_encrypt(json.dumps(data), self.aes_key, iv),
+                "iv": base64.b64encode(iv).decode(),
+            }
+        )
+
+    def _decrypt(self, raw: str) -> dict[str, Any]:
+        obj: dict[str, Any] = json.loads(raw)
+        if "content" in obj and "iv" in obj:
+            plain: dict[str, Any] = json.loads(
+                crypto.aes_decrypt(obj["content"], self.aes_key, base64.b64decode(obj["iv"]))
+            )
+            return plain
+        return obj
+
+    @staticmethod
+    def _require_ok(data: dict[str, Any], oid: str) -> dict[str, Any]:
+        result = data.get("result")
+        if result not in (None, "ZCFG_SUCCESS"):
+            raise ZyxelError(f"{oid}: {result} ({data.get('ReplyMsg', '')})")
+        return data
+
+    def _get_json(self, path: str) -> dict[str, Any]:
+        data: dict[str, Any] = json.loads(self._get_raw(path))
+        return data
+
+    def _get_raw(self, path: str) -> str:
+        return self._request_raw("GET", path, None, None)
+
+    def _post_raw(self, path: str, body: str, headers: dict[str, str]) -> str:
+        return self._request_raw("POST", path, body, headers)
+
+    def _request_raw(self, method: str, path: str, body: str | None, headers: dict[str, str] | None) -> str:
+        try:
+            r = self._http.request(method, path, content=body, headers=headers)
+            r.raise_for_status()
+            return r.text
+        except httpx.HTTPError as e:
+            raise ZyxelError(f"{method} {path}: {e}") from e
