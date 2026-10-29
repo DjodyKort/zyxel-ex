@@ -321,7 +321,10 @@ def nat_add(
             "Enable": not disabled,
             "Protocol": proto,
             "Description": name,
+            # An empty Interface only means "any WAN" with auto-detect on; without it the
+            # gateway accepts the rule but binds it to no WAN, so nothing is forwarded.
             "Interface": "",
+            "X_ZYXEL_AutoDetectWanStatus": True,
             "ExternalPortStart": ext_port,
             "ExternalPortEnd": ext_port,
             "InternalPortStart": ip,
