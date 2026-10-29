@@ -424,6 +424,37 @@ def _track_event(ntfy: str | None, kind: str, name: str, mac: str) -> None:
 # ── nat / port forwarding ───────────────────────────────────────────────────
 
 
+PORT = click.IntRange(1, 65535)
+PROTOCOLS = click.Choice(["TCP", "UDP", "ALL"])
+
+
+def _ipv4(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    if value is not None:
+        try:
+            ipaddress.IPv4Address(value)
+        except ValueError:
+            raise click.BadParameter(f"{value!r} is not an IPv4 address") from None
+    return value
+
+
+def _nat_wan(rule: dict[str, Any]) -> str:
+    """The WAN a rule listens on. An empty Interface means "any" only with auto-detect on;
+    a rule bound to none is accepted and listed by the gateway, but forwards nothing."""
+    if rule.get("Interface"):
+        return str(rule["Interface"])
+    # Firmware without the field has no such state, so treat it as "any".
+    return "any" if rule.get("X_ZYXEL_AutoDetectWanStatus", True) else "[red]none"
+
+
+def _describe_rule(rule: dict[str, Any]) -> str:
+    ext = _port_range(rule["ExternalPortStart"], rule["ExternalPortEnd"])
+    internal = _port_range(rule["InternalPortStart"], rule["InternalPortEnd"])
+    return (
+        f"'{rule.get('Description', '')}' "
+        f"({rule.get('Protocol', '')} {ext} → {rule.get('InternalClient', '')}:{internal})"
+    )
+
+
 @cli.group()
 def nat() -> None:
     """Port-forwarding rules."""
@@ -434,7 +465,7 @@ def nat() -> None:
 def nat_list(client: ZyxelClient) -> None:
     """List port-forward rules."""
     t = Table(title="Port forwarding")
-    for col in ("Idx", "On", "Name", "Proto", "WAN port", "→ Host", "Host port"):
+    for col in ("Idx", "On", "Name", "Proto", "WAN", "WAN port", "→ Host", "Host port"):
         t.add_column(col)
     for r in _objects(client, "nat"):
         t.add_row(
@@ -442,6 +473,7 @@ def nat_list(client: ZyxelClient) -> None:
             _yn(r["Enable"]),
             r["Description"],
             r["Protocol"],
+            _nat_wan(r),
             _port_range(r["ExternalPortStart"], r["ExternalPortEnd"]),
             r["InternalClient"],
             _port_range(r["InternalPortStart"], r["InternalPortEnd"]),
@@ -451,10 +483,10 @@ def nat_list(client: ZyxelClient) -> None:
 
 @nat.command("add")
 @click.option("--name", required=True, help="Rule description")
-@click.option("--to", "internal_client", required=True, help="Internal host IP")
-@click.option("--ext", "ext_port", required=True, type=int, help="External (WAN) port")
-@click.option("--int", "int_port", type=int, help="Internal port (default: same as --ext)")
-@click.option("--proto", type=click.Choice(["TCP", "UDP", "ALL"]), default="TCP", show_default=True)
+@click.option("--to", "internal_client", required=True, callback=_ipv4, help="Internal host IP")
+@click.option("--ext", "ext_port", required=True, type=PORT, help="External (WAN) port")
+@click.option("--int", "int_port", type=PORT, help="Internal port (default: same as --ext)")
+@click.option("--proto", type=PROTOCOLS, default="TCP", show_default=True)
 @click.option("--disabled", is_flag=True, help="Create the rule disabled")
 @needs_login
 def nat_add(
@@ -490,6 +522,45 @@ def nat_add(
     console.print(f"[green]added[/] {name}: WAN {ext_port} → {internal_client}:{ip} ({proto})")
 
 
+@nat.command("edit")
+@click.argument("index", type=int)
+@click.option("--name", help="New description")
+@click.option("--to", "internal_client", callback=_ipv4, help="New internal host IP")
+@click.option("--ext", "ext_port", type=PORT, help="New external (WAN) port")
+@click.option("--int", "int_port", type=PORT, help="New internal port")
+@click.option("--proto", type=PROTOCOLS, help="New protocol")
+@click.option("--any-wan", is_flag=True, help="Listen on any WAN (repairs a rule whose WAN shows 'none')")
+@needs_login
+def nat_edit(
+    client: ZyxelClient,
+    index: int,
+    name: str | None,
+    internal_client: str | None,
+    ext_port: int | None,
+    int_port: int | None,
+    proto: str | None,
+    any_wan: bool,
+) -> None:
+    """Change rule INDEX in place; every field not given stays as it is."""
+    changes: dict[str, Any] = {}
+    if name is not None:
+        changes["Description"] = name
+    if internal_client is not None:
+        changes["InternalClient"] = internal_client
+    if ext_port is not None:
+        changes.update(ExternalPortStart=ext_port, ExternalPortEnd=ext_port)
+    if int_port is not None:
+        changes.update(InternalPortStart=int_port, InternalPortEnd=int_port)
+    if proto is not None:
+        changes["Protocol"] = proto
+    if any_wan:
+        changes.update(Interface="", X_ZYXEL_AutoDetectWanStatus=True)
+    if not changes:
+        raise click.UsageError("nothing to change: give at least one option")
+    client.update_item("nat", index, changes)
+    console.print(f"[green]updated[/] rule {index}")
+
+
 @nat.command("enable")
 @click.argument("index", type=int)
 @needs_login
@@ -510,9 +581,18 @@ def nat_disable(client: ZyxelClient, index: int) -> None:
 
 @nat.command("rm")
 @click.argument("index", type=int)
+@click.option("-y", "--yes", is_flag=True, help="Delete without asking")
 @needs_login
-def nat_rm(client: ZyxelClient, index: int) -> None:
-    """Delete rule INDEX."""
+def nat_rm(client: ZyxelClient, index: int, yes: bool) -> None:
+    """Delete rule INDEX.
+
+    The gateway renumbers the rules after it, so list again before the next delete.
+    """
+    rule = next((r for r in _objects(client, "nat") if r.get("Index") == index), None)
+    if rule is None:
+        raise click.ClickException(f"no port-forward rule with index {index}")
+    if not yes:
+        click.confirm(f"Delete rule {index} {_describe_rule(rule)}?", abort=True)
     client.dal_delete("nat", index)
     console.print(f"[green]deleted[/] rule {index}")
 
