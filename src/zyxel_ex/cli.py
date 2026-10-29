@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import io
 import ipaddress
 import json
+import sys
 import time
 from collections.abc import Callable
 from typing import Any
@@ -72,18 +74,20 @@ def needs_login(f: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(f)
     @click.pass_obj
     def wrapper(client: ZyxelClient, *args: Any, **kwargs: Any) -> Any:
-        if not client.session_key:
-            if client.pin is None:
-                client.pin = credentials.pin(client.host)
-            if not client.password:
-                client.password = credentials.password(client.host, client.username) or click.prompt(
-                    "Password", hide_input=True
-                )
-            try:
+        # A gateway refusal (duplicate rule, bad value, expired session) is an answer for the
+        # user, not a crash: print it as one line instead of a traceback.
+        try:
+            if not client.session_key:
+                if client.pin is None:
+                    client.pin = credentials.pin(client.host)
+                if not client.password:
+                    client.password = credentials.password(client.host, client.username) or click.prompt(
+                        "Password", hide_input=True
+                    )
                 client.login()
-            except ZyxelError as e:
-                raise click.ClickException(str(e)) from e
-        return f(client, *args, **kwargs)
+            return f(client, *args, **kwargs)
+        except ZyxelError as e:
+            raise click.ClickException(str(e)) from e
 
     return wrapper
 
@@ -333,10 +337,12 @@ def watch(client: ZyxelClient, interval: int, ntfy: str | None, count: int) -> N
     try:
         while True:
             try:
-                devices = _lan_devices(client)
-            except ZyxelError:
-                client.login()  # refresh an expired session
-                devices = _lan_devices(client)
+                devices = _refreshing(client, _lan_devices)
+            except ZyxelError as e:
+                # The gateway rebooting or a Wi-Fi blip must not end a long-running watch.
+                console.print(f"[dim]poll failed ({e}); retrying in {interval}s[/]")
+                time.sleep(interval)
+                continue
             current = {
                 d["PhysAddress"].lower(): (d.get("HostName") or "?")
                 for d in devices
@@ -356,6 +362,15 @@ def watch(client: ZyxelClient, interval: int, ntfy: str | None, count: int) -> N
             time.sleep(interval)
     except KeyboardInterrupt:
         console.print("\n[dim]stopped[/]")
+
+
+def _refreshing(client: ZyxelClient, read: Callable[[ZyxelClient], Any]) -> Any:
+    """Run a read; if it fails, log in again once (sessions expire) and retry."""
+    try:
+        return read(client)
+    except ZyxelError:
+        client.login()
+        return read(client)
 
 
 def _track_event(ntfy: str | None, kind: str, name: str, mac: str) -> None:
@@ -513,7 +528,7 @@ def wifi_disable(client: ZyxelClient, index: int) -> None:
 @cli.command()
 @needs_login
 def dhcp(client: ZyxelClient) -> None:
-    """Static DHCP reservations (IP ⇔ MAC bindings)."""
+    """Static DHCP reservations (IP <-> MAC bindings)."""
     names = {d.get("PhysAddress", "").lower(): d.get("HostName", "") for d in _lan_devices(client)}
     t = Table(title="DHCP reservations")
     for col in ("Idx", "On", "Host", "MAC", "IP"):
@@ -543,8 +558,14 @@ def firewall(client: ZyxelClient) -> None:
 @cli.command()
 @click.option("--serve", is_flag=True, help="Run an HTTP /metrics server instead of printing once")
 @click.option("--port", default=9100, show_default=True, type=int)
+@click.option(
+    "--bind",
+    default="127.0.0.1",
+    show_default=True,
+    help="Listen address; 0.0.0.0 exposes device names/MACs/IPs to the whole network, unauthenticated",
+)
 @needs_login
-def metrics(client: ZyxelClient, serve: bool, port: int) -> None:
+def metrics(client: ZyxelClient, serve: bool, port: int, bind: str) -> None:
     """Prometheus metrics — print once, or `--serve` an HTTP exporter."""
     if not serve:
         click.echo(_metrics_text(client), nl=False)
@@ -559,10 +580,10 @@ def metrics(client: ZyxelClient, serve: bool, port: int) -> None:
                 self.end_headers()
                 return
             try:
-                body = _metrics_text(client)
+                body = _refreshing(client, _metrics_text)
             except ZyxelError:
-                client.login()
-                body = _metrics_text(client)
+                # Prometheus convention: a scrape still answers, and zyxel_up says why it is empty.
+                body = "# TYPE zyxel_up gauge\nzyxel_up 0\n"
             data = body.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -573,9 +594,9 @@ def metrics(client: ZyxelClient, serve: bool, port: int) -> None:
         def log_message(self, format: str, *args: Any) -> None:
             pass  # quiet
 
-    console.print(f"[dim]serving metrics on http://0.0.0.0:{port}/metrics — Ctrl+C to stop[/]")
+    console.print(f"[dim]serving metrics on http://{bind}:{port}/metrics — Ctrl+C to stop[/]")
     with contextlib.suppress(KeyboardInterrupt):
-        HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+        HTTPServer((bind, port), Handler).serve_forever()
 
 
 def _esc(s: str) -> str:
@@ -677,5 +698,15 @@ def backup_decode(conf_file: str, secrets: bool, out: str | None) -> None:
         click.echo(xml.decode("utf-8", "replace"))
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point."""
+    # A non-UTF-8 console (Windows cp1252, or output piped on Windows) cannot encode every
+    # character rich and the help texts use; degrade those to '?' instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper) and (stream.encoding or "").lower() not in ("utf-8", "utf8"):
+            stream.reconfigure(errors="replace")
     cli()
+
+
+if __name__ == "__main__":
+    main()

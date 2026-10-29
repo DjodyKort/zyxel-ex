@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zyx = "zyxel_ex.cli:cli"
+zyx = "zyxel_ex.cli:main"
 
 [project.optional-dependencies]
 dev = ["ruff>=0.6", "mypy>=1.11", "pytest>=8"]

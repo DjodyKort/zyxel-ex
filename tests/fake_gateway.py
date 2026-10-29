@@ -60,6 +60,7 @@ class FakeGateway:
         self.cert = cert
         self.tables: dict[str, list[dict[str, Any]]] = tables or {}
         self.rejections: dict[str, str] = {}  # oid -> ReplyMsg returned for any write to it
+        self.fail_reads = 0  # the next N DAL reads fail, like a gateway that is rebooting
         self.writes: list[tuple[str, str, dict[str, Any]]] = []  # (method, oid, decrypted record)
         self.login_attempts = 0
         self.logins = 0
@@ -141,6 +142,9 @@ class FakeGateway:
         oid = request.url.params["oid"]
         rows = self.tables.setdefault(oid, [])
         if request.method == "GET":
+            if self.fail_reads:
+                self.fail_reads -= 1
+                return self._reply({"result": "ZCFG_INTERNAL_ERROR", "ReplyMsg": "busy"})
             return self._reply({"result": "ZCFG_SUCCESS", "Object": rows})
         record = self._decrypt(request.content)
         self.writes.append((request.method, oid, record))
