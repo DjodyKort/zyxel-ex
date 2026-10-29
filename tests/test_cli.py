@@ -56,7 +56,7 @@ def test_metrics_prints_prometheus_text() -> None:
             "status": [{"DeviceInfo": {"ModelName": "EX5601-T1", "SoftwareVersion": "V5", "UpTime": 60}}],
             "lanhosts": [{"lanhosts": [{"PhysAddress": "AA", "HostName": "pc", "Active": True}]}],
             "nat": [{"Index": 1}],
-            "cardpage_status": [{"IPAddress": "188.90.155.181"}],
+            "cardpage_status": [{"IPAddress": "8.8.8.8"}],
         }
     )
     result = zyx(gw, "--password", "s3cret", "metrics")

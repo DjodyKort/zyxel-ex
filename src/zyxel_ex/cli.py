@@ -25,8 +25,8 @@ from keyring.errors import KeyringError
 from rich.console import Console
 from rich.table import Table
 
+from . import __version__, credentials
 from . import backup as _backup
-from . import credentials
 from .client import ZyxelClient, ZyxelError
 
 console = Console()
@@ -68,6 +68,7 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, path: str | None)
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.version_option(__version__, prog_name="zyx")
 @click.option(
     "--env-file",
     envvar="ZY_ENV_FILE",
