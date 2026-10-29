@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import ssl
 from types import TracebackType
 from typing import Any
 
@@ -17,6 +19,21 @@ DEFAULT_HOST = "192.168.1.1"
 
 class ZyxelError(RuntimeError):
     """A DAL call returned a non-success result, or the transport failed."""
+
+
+class PinMismatchError(ZyxelError):
+    """The gateway's TLS certificate does not match the pinned fingerprint."""
+
+
+def normalize_fingerprint(fp: str) -> str:
+    """Lower-case hex without separators, so ``AB:CD:…`` and ``abcd…`` compare equal."""
+    return fp.replace(":", "").replace(" ", "").lower()
+
+
+def cert_fingerprint(host: str, port: int = 443, *, timeout: float = 10.0) -> str:
+    """SHA-256 fingerprint (hex) of the gateway's TLS certificate, for pinning."""
+    pem = ssl.get_server_certificate((host, port), timeout=timeout)
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
 
 
 class ZyxelClient:
@@ -34,6 +51,7 @@ class ZyxelClient:
         password: str = "",
         *,
         verify: bool = False,
+        pin: str | None = None,
         timeout: float = 20.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -43,7 +61,11 @@ class ZyxelClient:
         self.base = f"https://{host}"
         self.aes_key: bytes = b""
         self.session_key: str = ""
-        self.login_sha512: bool = False  # set by the CLI; used on lazy login
+        self.login_sha512: bool = False  # default for login(); set by the CLI
+        # SHA-256 of the gateway's cert. The cert is self-signed, so CA verification is
+        # useless; a pin is what stops a LAN man-in-the-middle from handing us its own
+        # RSA key at login and reading the password.
+        self.pin: str | None = normalize_fingerprint(pin) if pin else None
         self._device_info: dict[str, Any] | None = None
         # verify=False: these gateways ship a self-signed cert on the LAN.
         # transport is injectable for tests (a fake gateway).
@@ -73,12 +95,15 @@ class ZyxelClient:
 
     # -- auth ---------------------------------------------------------------
 
-    def login(self, *, sha512: bool = False) -> dict[str, Any]:
+    def login(self, *, sha512: bool | None = None) -> dict[str, Any]:
         """Perform the RSA+AES handshake and establish a session.
 
         Some firmware variants expect the password SHA-512-hashed rather than
-        base64-encoded; set ``sha512=True`` for those.
+        base64-encoded; set ``sha512=True`` for those. Left unset, it follows
+        ``login_sha512``, so a session refresh logs in the same way as the first login.
         """
+        if sha512 is None:
+            sha512 = self.login_sha512
         rsa_key = self._get_json("/getRSAPublickKey")["RSAPublicKey"]
         self.aes_key = crypto.gen_key()
         iv = crypto.gen_iv()
@@ -225,7 +250,25 @@ class ZyxelClient:
     def _request_raw(self, method: str, path: str, body: str | None, headers: dict[str, str] | None) -> str:
         try:
             r = self._http.request(method, path, content=body, headers=headers)
+            if self.pin:
+                self._check_pin(r)
             r.raise_for_status()
             return r.text
         except httpx.HTTPError as e:
             raise ZyxelError(f"{method} {path}: {e}") from e
+
+    def _check_pin(self, response: httpx.Response) -> None:
+        # Checked on every response; the first one (the RSA key fetch) carries no secret,
+        # so a mismatch is caught before the password is ever sent.
+        stream = response.extensions.get("network_stream")
+        ssl_object = stream.get_extra_info("ssl_object") if stream else None
+        der = ssl_object.getpeercert(True) if ssl_object else None
+        if not der:
+            raise PinMismatchError("a TLS pin is set but the gateway certificate could not be read")
+        actual = hashlib.sha256(der).hexdigest()
+        if not hmac.compare_digest(actual, self.pin or ""):
+            raise PinMismatchError(
+                f"TLS certificate of {self.host} does not match the pin "
+                f"(got {actual}). If the gateway's cert legitimately changed "
+                "(firmware update, factory reset), re-pin it; otherwise do not log in."
+            )

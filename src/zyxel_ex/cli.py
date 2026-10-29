@@ -17,11 +17,13 @@ from typing import Any
 
 import click
 import httpx
+from keyring.errors import KeyringError
 from rich.console import Console
 from rich.table import Table
 
 from . import backup as _backup
-from .client import ZyxelClient, ZyxelError
+from . import credentials
+from .client import ZyxelClient, ZyxelError, cert_fingerprint
 
 console = Console()
 
@@ -37,14 +39,25 @@ KNOWN_OIDS = [
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--host", envvar="ZY_HOST", default="192.168.1.1", show_default=True, help="Gateway IP")
 @click.option("--user", envvar="ZY_USER", default="admin", show_default=True, help="Admin username")
-@click.option("--password", envvar="ZY_PASS", help="Admin password (or set ZY_PASS)")
+@click.option(
+    "--password",
+    envvar="ZY_PASS",
+    help="Admin password. Prefer `zyx auth save` (OS keyring) or ZY_PASS: flags end up in shell history",
+)
+@click.option("--pin", envvar="ZY_PIN", help="Expected SHA-256 of the gateway's TLS cert (see `zyx cert`)")
 @click.option("--sha512", is_flag=True, help="Hash the password (some firmware variants require it)")
 @click.pass_context
-def cli(ctx: click.Context, host: str, user: str, password: str | None, sha512: bool) -> None:
-    """Scriptable control for Zyxel EX/AX/VMG (OPAL) home gateways."""
+def cli(
+    ctx: click.Context, host: str, user: str, password: str | None, pin: str | None, sha512: bool
+) -> None:
+    """Scriptable control for Zyxel EX/AX/VMG (OPAL) home gateways.
+
+    The password comes from --password / ZY_PASS, else the OS keyring (`zyx auth save`),
+    else a prompt. The TLS pin comes from --pin / ZY_PIN, else the keyring.
+    """
     # Lazy: don't connect (or prompt for a password) until a command needs the
     # gateway — so offline commands like `backup decode` work with no modem.
-    client = ZyxelClient(host, user, password or "")
+    client = ZyxelClient(host, user, password or "", pin=pin)
     client.login_sha512 = sha512
     ctx.obj = client
     ctx.call_on_close(client.close)
@@ -58,10 +71,14 @@ def needs_login(f: Callable[..., Any]) -> Callable[..., Any]:
     @click.pass_obj
     def wrapper(client: ZyxelClient, *args: Any, **kwargs: Any) -> Any:
         if not client.session_key:
+            if client.pin is None:
+                client.pin = credentials.pin(client.host)
             if not client.password:
-                client.password = click.prompt("Password", hide_input=True)
+                client.password = credentials.password(client.host, client.username) or click.prompt(
+                    "Password", hide_input=True
+                )
             try:
-                client.login(sha512=client.login_sha512)
+                client.login()
             except ZyxelError as e:
                 raise click.ClickException(str(e)) from e
         return f(client, *args, **kwargs)
@@ -79,6 +96,85 @@ def _port_range(start: int, end: int) -> str:
 
 def _yn(value: Any) -> str:
     return "[green]✓" if value else "[dim]—"
+
+
+# ── auth ──────────────────────────────────────────────────────────────────
+
+
+@cli.command()
+@click.pass_obj
+def cert(client: ZyxelClient) -> None:
+    """Print the SHA-256 fingerprint of the gateway's TLS certificate (for --pin / ZY_PIN)."""
+    try:
+        click.echo(cert_fingerprint(client.host))
+    except OSError as e:
+        raise click.ClickException(f"could not reach {client.host}: {e}") from e
+
+
+@cli.group()
+def auth() -> None:
+    """Credentials in the OS keyring."""
+
+
+@auth.command("save")
+@click.option("-y", "--yes", is_flag=True, help="Trust the gateway's current certificate without asking")
+@click.pass_obj
+def auth_save(client: ZyxelClient, yes: bool) -> None:
+    """Check the password against the gateway, then store it plus the gateway's TLS pin."""
+    if not client.pin:
+        # Trust on first use, like SSH: show the fingerprint once, pin it from then on.
+        try:
+            fingerprint = cert_fingerprint(client.host)
+        except OSError as e:
+            raise click.ClickException(f"could not reach {client.host}: {e}") from e
+        console.print(f"certificate SHA-256 of {client.host}: [bold]{fingerprint}")
+        if not yes:
+            click.confirm("Trust this certificate?", default=True, abort=True)
+        client.pin = fingerprint
+    if not client.password:
+        client.password = click.prompt("Password", hide_input=True)
+    try:
+        client.login()
+        credentials.save(client.host, client.username, client.password, client.pin)
+    except ZyxelError as e:
+        raise click.ClickException(str(e)) from e
+    except KeyringError as e:
+        raise click.ClickException(f"no usable OS keyring here ({e}); use ZY_PASS / ZY_PIN instead") from e
+    console.print(f"[green]saved[/] {client.username}@{client.host} and its certificate pin")
+
+
+@auth.command("forget")
+@click.pass_obj
+def auth_forget(client: ZyxelClient) -> None:
+    """Remove the stored password and pin for this host/user."""
+    if credentials.forget(client.host, client.username):
+        console.print(f"[yellow]forgot[/] {client.username}@{client.host}")
+    else:
+        console.print(f"[dim]nothing stored for {client.username}@{client.host}")
+
+
+@auth.command("status")
+@click.pass_obj
+def auth_status(client: ZyxelClient) -> None:
+    """Show where the password and TLS pin for this host/user come from."""
+    stored_pin = credentials.pin(client.host)
+    if client.password:
+        pw_source = "--password / ZY_PASS"
+    elif credentials.password(client.host, client.username):
+        pw_source = "keyring"
+    else:
+        pw_source = "[yellow]none (will prompt)"
+    if client.pin:
+        pin_source = f"--pin / ZY_PIN ({client.pin})"
+    elif stored_pin:
+        pin_source = f"keyring ({stored_pin})"
+    else:
+        pin_source = "[red]none: the gateway's identity is not checked"
+    t = Table(show_header=False, box=None)
+    t.add_row("[bold]Gateway", f"{client.username}@{client.host}")
+    t.add_row("[bold]Password", pw_source)
+    t.add_row("[bold]TLS pin", pin_source)
+    console.print(t)
 
 
 # ── system ────────────────────────────────────────────────────────────────
