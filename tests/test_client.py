@@ -1,80 +1,59 @@
-"""End-to-end handshake test against a fake in-memory Zyxel gateway.
+"""End-to-end client tests against the in-memory fake gateway (see fake_gateway.py).
 
-The fake transport does exactly what a real gateway does: hands out an RSA
-public key, RSA-decrypts the AES key the client wraps at login, and AES-encrypts
-every response with that session key. So this exercises the complete
-RSA+AES handshake and DAL read path with no hardware.
+The fake does the real RSA+AES handshake, so these exercise the complete login,
+encrypted DAL read/write and logout paths with no hardware.
 """
 
 from __future__ import annotations
 
-import base64
-import json
-from typing import Any
-
-import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from fake_gateway import FakeGateway
 
-from zyxel_ex import ZyxelClient, ZyxelError, crypto
-
-
-def _fake_gateway(*, expect_user: str = "admin", expect_pass: str = "s3cret") -> httpx.MockTransport:
-    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pub_pem = (
-        priv.public_key()
-        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-        .decode()
-    )
-    state: dict[str, bytes] = {}
-
-    def enc(key: bytes, obj: dict[str, Any]) -> str:
-        iv = crypto.gen_iv()
-        return json.dumps(
-            {"content": crypto.aes_encrypt(json.dumps(obj), key, iv), "iv": base64.b64encode(iv).decode()}
-        )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/getRSAPublickKey":
-            return httpx.Response(200, text=json.dumps({"RSAPublicKey": pub_pem, "result": "ZCFG_SUCCESS"}))
-        if path == "/UserLogin":
-            body = json.loads(request.content)
-            aes_key_b64 = priv.decrypt(base64.b64decode(body["key"]), padding.PKCS1v15()).decode()
-            key = base64.b64decode(aes_key_b64)
-            state["key"] = key
-            login = json.loads(crypto.aes_decrypt(body["content"], key, base64.b64decode(body["iv"])))
-            ok = (
-                login["Input_Account"] == expect_user
-                and base64.b64decode(login["Input_Passwd"]).decode() == expect_pass
-            )
-            payload = {"sessionkey": "SK-123", "result": "ZCFG_SUCCESS"} if ok else {"result": "Invalid"}
-            return httpx.Response(200, text=enc(key, payload))
-        if path == "/cgi-bin/DAL":
-            key = state["key"]
-            oid = request.url.params.get("oid")
-            data = {"result": "ZCFG_SUCCESS", "Object": [{"Index": 1, "Enable": True, "Description": oid}]}
-            return httpx.Response(200, text=enc(key, data))
-        return httpx.Response(200, text=json.dumps({"result": "ZCFG_SUCCESS"}))
-
-    return httpx.MockTransport(handler)
+from zyxel_ex import ZyxelClient, ZyxelError
 
 
 def test_login_and_dal_read() -> None:
-    z = ZyxelClient("gw", "admin", "s3cret", transport=_fake_gateway())
+    gw = FakeGateway(tables={"nat": [{"Index": 1, "Description": "ssh"}]})
+    z = ZyxelClient("gw", "admin", "s3cret", transport=gw.transport)
     z.login()
-    assert z.session_key == "SK-123"
-    rules = z.dal_list("nat")
-    assert rules[0]["Description"] == "nat"
+    assert z.session_key == "SK-1"
+    assert z.dal_list("nat")[0]["Description"] == "ssh"
 
 
-def test_context_manager() -> None:
-    with ZyxelClient("gw", "admin", "s3cret", transport=_fake_gateway()) as z:
+def test_context_manager_logs_in_and_out() -> None:
+    gw = FakeGateway()
+    with ZyxelClient("gw", "admin", "s3cret", transport=gw.transport) as z:
+        assert gw.logged_in
         assert z.dal_get("status")["result"] == "ZCFG_SUCCESS"
+    assert not gw.logged_in
 
 
 def test_bad_password_raises() -> None:
-    z = ZyxelClient("gw", "admin", "wrong", transport=_fake_gateway())
+    gw = FakeGateway()
     with pytest.raises(ZyxelError):
-        z.login()
+        ZyxelClient("gw", "admin", "wrong", transport=gw.transport).login()
+
+
+def test_update_item_echoes_the_device_record() -> None:
+    # Firmware-specific fields the client knows nothing about must survive an edit.
+    rule = {"Index": 1, "Enable": True, "Description": "ssh", "X_VENDOR_Field": 7}
+    gw = FakeGateway(tables={"nat": [rule]})
+    with ZyxelClient("gw", "admin", "s3cret", transport=gw.transport) as z:
+        z.update_item("nat", 1, {"Enable": False})
+    assert gw.writes == [("PUT", "nat", {**rule, "Enable": False})]
+
+
+def test_update_item_unknown_index_raises() -> None:
+    gw = FakeGateway(tables={"nat": []})
+    with (
+        ZyxelClient("gw", "admin", "s3cret", transport=gw.transport) as z,
+        pytest.raises(ZyxelError, match="no record with Index 3"),
+    ):
+        z.update_item("nat", 3, {"Enable": False})
+
+
+def test_delete_renumbers_like_the_gateway() -> None:
+    gw = FakeGateway(tables={"nat": [{"Index": 1, "Description": "a"}, {"Index": 2, "Description": "b"}]})
+    with ZyxelClient("gw", "admin", "s3cret", transport=gw.transport) as z:
+        z.dal_delete("nat", 1)
+        assert z.dal_list("nat") == [{"Index": 1, "Description": "b"}]

@@ -6,7 +6,6 @@ import base64
 import hashlib
 import hmac
 import json
-import ssl
 from types import TracebackType
 from typing import Any
 
@@ -28,12 +27,6 @@ class PinMismatchError(ZyxelError):
 def normalize_fingerprint(fp: str) -> str:
     """Lower-case hex without separators, so ``AB:CD:…`` and ``abcd…`` compare equal."""
     return fp.replace(":", "").replace(" ", "").lower()
-
-
-def cert_fingerprint(host: str, port: int = 443, *, timeout: float = 10.0) -> str:
-    """SHA-256 fingerprint (hex) of the gateway's TLS certificate, for pinning."""
-    pem = ssl.get_server_certificate((host, port), timeout=timeout)
-    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
 
 
 class ZyxelClient:
@@ -199,6 +192,21 @@ class ZyxelClient:
             )
         return self._device_info
 
+    def fetch_fingerprint(self) -> str:
+        """SHA-256 (hex) of the certificate the gateway presents now, for pinning.
+
+        Read over the client's own connection and deliberately not checked against
+        ``pin``: this is how you find out what to pin, or what the gateway changed to.
+        """
+        try:
+            r = self._http.get("/getRSAPublickKey")
+        except httpx.HTTPError as e:
+            raise ZyxelError(f"GET /getRSAPublickKey: {e}") from e
+        fingerprint = self._peer_fingerprint(r)
+        if not fingerprint:
+            raise ZyxelError(f"{self.host} did not present a TLS certificate")
+        return fingerprint
+
     @property
     def model(self) -> str:
         return str(self.device_info().get("ModelName", ""))
@@ -257,15 +265,19 @@ class ZyxelClient:
         except httpx.HTTPError as e:
             raise ZyxelError(f"{method} {path}: {e}") from e
 
-    def _check_pin(self, response: httpx.Response) -> None:
-        # Checked on every response; the first one (the RSA key fetch) carries no secret,
-        # so a mismatch is caught before the password is ever sent.
+    @staticmethod
+    def _peer_fingerprint(response: httpx.Response) -> str | None:
         stream = response.extensions.get("network_stream")
         ssl_object = stream.get_extra_info("ssl_object") if stream else None
         der = ssl_object.getpeercert(True) if ssl_object else None
-        if not der:
+        return hashlib.sha256(der).hexdigest() if der else None
+
+    def _check_pin(self, response: httpx.Response) -> None:
+        # Checked on every response; the first one (the RSA key fetch) carries no secret,
+        # so a mismatch is caught before the password is ever sent.
+        actual = self._peer_fingerprint(response)
+        if not actual:
             raise PinMismatchError("a TLS pin is set but the gateway certificate could not be read")
-        actual = hashlib.sha256(der).hexdigest()
         if not hmac.compare_digest(actual, self.pin or ""):
             raise PinMismatchError(
                 f"TLS certificate of {self.host} does not match the pin "

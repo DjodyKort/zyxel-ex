@@ -23,7 +23,7 @@ from rich.table import Table
 
 from . import backup as _backup
 from . import credentials
-from .client import ZyxelClient, ZyxelError, cert_fingerprint
+from .client import ZyxelClient, ZyxelError
 
 console = Console()
 
@@ -57,7 +57,9 @@ def cli(
     """
     # Lazy: don't connect (or prompt for a password) until a command needs the
     # gateway — so offline commands like `backup decode` work with no modem.
-    client = ZyxelClient(host, user, password or "", pin=pin)
+    # Callers may hand in an httpx transport as `obj` (the tests use a fake gateway).
+    transport = ctx.obj if isinstance(ctx.obj, httpx.BaseTransport) else None
+    client = ZyxelClient(host, user, password or "", pin=pin, transport=transport)
     client.login_sha512 = sha512
     ctx.obj = client
     ctx.call_on_close(client.close)
@@ -106,9 +108,9 @@ def _yn(value: Any) -> str:
 def cert(client: ZyxelClient) -> None:
     """Print the SHA-256 fingerprint of the gateway's TLS certificate (for --pin / ZY_PIN)."""
     try:
-        click.echo(cert_fingerprint(client.host))
-    except OSError as e:
-        raise click.ClickException(f"could not reach {client.host}: {e}") from e
+        click.echo(client.fetch_fingerprint())
+    except ZyxelError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @cli.group()
@@ -124,9 +126,9 @@ def auth_save(client: ZyxelClient, yes: bool) -> None:
     if not client.pin:
         # Trust on first use, like SSH: show the fingerprint once, pin it from then on.
         try:
-            fingerprint = cert_fingerprint(client.host)
-        except OSError as e:
-            raise click.ClickException(f"could not reach {client.host}: {e}") from e
+            fingerprint = client.fetch_fingerprint()
+        except ZyxelError as e:
+            raise click.ClickException(str(e)) from e
         console.print(f"certificate SHA-256 of {client.host}: [bold]{fingerprint}")
         if not yes:
             click.confirm("Trust this certificate?", default=True, abort=True)
