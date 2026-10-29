@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from zyxel_ex import crypto
-from zyxel_ex.cli import cli
+from zyxel_ex.cli import ENV_FILE_KEYS, cli
 
 
 class _SSLObject:
@@ -164,7 +164,14 @@ class FakeGateway:
         return self._reply({"result": "ZCFG_SUCCESS"})
 
 
-def zyx(gateway: FakeGateway | None, *args: str, input: str | None = None) -> Result:
-    """Run the CLI against ``gateway``, isolated from the developer's own ZY_* variables."""
-    runner = CliRunner(env=dict.fromkeys(("ZY_HOST", "ZY_USER", "ZY_PASS", "ZY_PIN", "ZY_SHA512")))
+def zyx(
+    gateway: FakeGateway | None, *args: str, input: str | None = None, env: dict[str, str] | None = None
+) -> Result:
+    """Run the CLI against ``gateway``, isolated from the developer's own ZY_* variables.
+
+    ``cli`` itself never looks for a ``.env``; only the ``main()`` entry point does, so a
+    developer's ``.env`` cannot leak in here either.
+    """
+    isolated: dict[str, str | None] = dict.fromkeys((*ENV_FILE_KEYS, "ZY_ENV_FILE"))
+    runner = CliRunner(env={**isolated, **(env or {})})
     return runner.invoke(cli, list(args), obj=gateway.transport if gateway else None, input=input)

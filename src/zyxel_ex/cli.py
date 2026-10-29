@@ -15,10 +15,12 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import click
 import httpx
+from dotenv import dotenv_values
 from keyring.errors import KeyringError
 from rich.console import Console
 from rich.table import Table
@@ -37,8 +39,44 @@ KNOWN_OIDS = [
     "usb_info", "MultiWan", "ethwanlan", "port_mirror", "ipalias", "policy_route",
 ]  # fmt: skip
 
+# The .env keys `zyx` reads, and the option each one fills in.
+ENV_FILE_KEYS = {
+    "ZY_HOST": "host",
+    "ZY_USER": "user",
+    "ZY_PASS": "password",
+    "ZY_PIN": "pin",
+    "ZY_SHA512": "sha512",
+}
+
+
+def find_env_file(cwd: Path, home: Path) -> Path | None:
+    """The ``.env`` to use when none is named: the working directory's, else the user's."""
+    for candidate in (cwd / ".env", home / ".config" / "zyxel-ex" / ".env"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_env_file(ctx: click.Context, param: click.Parameter, path: str | None) -> None:
+    # Eager, so it runs before the other options read their defaults. The values become
+    # defaults, not environment: a flag or a real ZY_* variable still overrides the file.
+    if not path:
+        return
+    values = dotenv_values(path)
+    defaults = {option: values[key] for key, option in ENV_FILE_KEYS.items() if values.get(key)}
+    ctx.default_map = {**(ctx.default_map or {}), **defaults}
+
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--env-file",
+    envvar="ZY_ENV_FILE",
+    type=click.Path(exists=True, dir_okay=False),
+    is_eager=True,
+    expose_value=False,
+    callback=_load_env_file,
+    help="Read ZY_* settings from this file [default: ./.env, else ~/.config/zyxel-ex/.env]",
+)
 @click.option("--host", envvar="ZY_HOST", default="192.168.1.1", show_default=True, help="Gateway IP")
 @click.option("--user", envvar="ZY_USER", default="admin", show_default=True, help="Admin username")
 @click.option(
@@ -47,7 +85,9 @@ KNOWN_OIDS = [
     help="Admin password. Prefer `zyx auth save` (OS keyring) or ZY_PASS: flags end up in shell history",
 )
 @click.option("--pin", envvar="ZY_PIN", help="Expected SHA-256 of the gateway's TLS cert (see `zyx cert`)")
-@click.option("--sha512", is_flag=True, help="Hash the password (some firmware variants require it)")
+@click.option(
+    "--sha512", envvar="ZY_SHA512", is_flag=True, help="Hash the password (some firmware variants require it)"
+)
 @click.pass_context
 def cli(
     ctx: click.Context, host: str, user: str, password: str | None, pin: str | None, sha512: bool
@@ -705,7 +745,8 @@ def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         if isinstance(stream, io.TextIOWrapper) and (stream.encoding or "").lower() not in ("utf-8", "utf8"):
             stream.reconfigure(errors="replace")
-    cli()
+    env_file = find_env_file(Path.cwd(), Path.home())
+    cli.main(default_map={"env_file": str(env_file)} if env_file else None)
 
 
 if __name__ == "__main__":

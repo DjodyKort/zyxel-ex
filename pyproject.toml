@@ -12,6 +12,7 @@ dependencies = [
     "click>=8.1",
     "rich>=13",
     "keyring>=24",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]
